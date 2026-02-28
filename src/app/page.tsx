@@ -10,22 +10,24 @@ export default function Home(){
 
 const mountRef = useRef<HTMLDivElement | null>(null)
 
-const satellitesRef = useRef<any[]>([])
-
 const simulationSpeed = useRef(50)
 
-const simTimeRef = useRef(new Date())
+const satellitesRef = useRef<any[]>([])
 
-const lastFrameRef = useRef(Date.now())
-
-const pausedRef = useRef(false)
+const startRealTime = useRef(Date.now())
 
 const [satCount,setSatCount] = useState(0)
 const [warning,setWarning] = useState("No Collision Risk")
+
 const [selectedSat,setSelectedSat] = useState<any>(null)
+
 const [speedUI,setSpeedUI] = useState(50)
+
 const [prediction,setPrediction] = useState("Scanning orbits...")
+
 const [paused,setPaused] = useState(false)
+
+const orbitLinesRef = useRef<any[]>([])
 
 useEffect(()=>{
 
@@ -40,7 +42,7 @@ window.innerWidth/window.innerHeight,
 3000
 )
 
-camera.position.set(0,3,10)
+camera.position.set(0,4,10)
 
 const renderer = new THREE.WebGLRenderer({antialias:true})
 renderer.setSize(window.innerWidth,window.innerHeight)
@@ -74,7 +76,7 @@ scene.add(light)
 // STARS
 
 const starGeometry = new THREE.BufferGeometry()
-const starCount = 5000
+const starCount = 6000
 const starPositions = new Float32Array(starCount*3)
 
 for(let i=0;i<starCount*3;i++){
@@ -113,11 +115,36 @@ const sprite=new THREE.Sprite(
 new THREE.SpriteMaterial({map:texture})
 )
 
-sprite.scale.set(0.6,0.3,1)
+sprite.scale.set(0.7,0.35,1)
 
 return sprite
 
 }
+
+// ORBIT RINGS
+
+function createRing(radius:number,color:number){
+
+const geometry=new THREE.RingGeometry(radius,radius+0.01,128)
+const material=new THREE.MeshBasicMaterial({
+color,
+side:THREE.DoubleSide,
+transparent:true,
+opacity:0.4
+})
+
+const mesh=new THREE.Mesh(geometry,material)
+mesh.rotation.x=Math.PI/2
+
+scene.add(mesh)
+
+}
+
+createRing(2.4,0x00ffff)
+createRing(3.2,0xffff00)
+createRing(4.5,0xff0000)
+
+// SAT STORAGE
 
 const satellites:any[]=[]
 satellitesRef.current=satellites
@@ -126,7 +153,9 @@ satellitesRef.current=satellites
 
 async function loadSatellites(){
 
-const response = await axios.get("/active.txt")
+const url="/active.txt"
+
+const response=await axios.get(url)
 
 const lines=response.data
 .split("\n")
@@ -162,7 +191,8 @@ mesh,
 label,
 lat:0,
 lon:0,
-alt:0
+alt:0,
+orbitLine:null
 })
 
 if(satellites.length>=200) break
@@ -193,9 +223,60 @@ satellitesRef.current.map(s=>s.mesh)
 if(intersects.length>0){
 
 const mesh=intersects[0].object
+
 const sat=satellitesRef.current.find(s=>s.mesh===mesh)
 
-if(sat){
+if(!sat) return
+
+// TOGGLE ORBIT
+
+if(sat.orbitLine){
+
+scene.remove(sat.orbitLine)
+sat.orbitLine=null
+
+}else{
+
+const points=[]
+
+for(let i=0;i<360;i+=5){
+
+const future=new Date(Date.now()+i*60000)
+
+const pv=satellite.propagate(sat.satrec,future)
+
+if(!pv.position) continue
+
+const gmst=satellite.gstime(future)
+const geo=satellite.eciToGeodetic(pv.position,gmst)
+
+const lat=geo.latitude
+const lon=geo.longitude
+const alt=geo.height
+
+const r=2+alt/2000
+
+const x=r*Math.cos(lat)*Math.cos(lon)
+const y=r*Math.sin(lat)
+const z=-r*Math.cos(lat)*Math.sin(lon)
+
+points.push(new THREE.Vector3(x,y,z))
+
+}
+
+const geometry=new THREE.BufferGeometry().setFromPoints(points)
+
+const material=new THREE.LineBasicMaterial({color:0x00ffff})
+
+const line=new THREE.Line(geometry,material)
+
+scene.add(line)
+
+sat.orbitLine=line
+
+}
+
+// PANEL DATA
 
 let nearest=null
 let minDist=999
@@ -207,8 +288,10 @@ if(other===sat) return
 const d=sat.mesh.position.distanceTo(other.mesh.position)
 
 if(d<minDist){
+
 minDist=d
 nearest=other
+
 }
 
 })
@@ -225,43 +308,36 @@ risk:(1/minDist).toFixed(2)
 
 }
 
-}
-
 })
 
 // SIMULATION LOOP
 
-const collisionDistance=0.25
+const collisionDistance=0.05
 
 const animate=()=>{
 
 requestAnimationFrame(animate)
 
-const now = Date.now()
+if(!paused){
 
-const delta = (now - lastFrameRef.current)/1000
+const elapsed =
+(Date.now()-startRealTime.current)/1000
 
-lastFrameRef.current = now
-
-if(!pausedRef.current){
-
-simTimeRef.current = new Date(
-simTimeRef.current.getTime() + delta * 1000 * simulationSpeed.current
+const simTime = new Date(
+startRealTime.current + elapsed*1000*simulationSpeed.current
 )
 
-}
-
-earth.rotation.y += 0.0002 * simulationSpeed.current
+earth.rotation.y += 0.0001 * simulationSpeed.current
 
 satellites.forEach((sat)=>{
 
-const posVel=satellite.propagate(sat.satrec,simTimeRef.current)
-const pos=posVel.position
+const posVel=satellite.propagate(sat.satrec,simTime)
 
-if(pos){
+if(!posVel.position) return
 
-const gmst=satellite.gstime(simTimeRef.current)
-const geo=satellite.eciToGeodetic(pos,gmst)
+const gmst=satellite.gstime(simTime)
+
+const geo=satellite.eciToGeodetic(posVel.position,gmst)
 
 sat.lon=geo.longitude
 sat.lat=geo.latitude
@@ -274,15 +350,15 @@ const y=radius*Math.sin(sat.lat)
 const z=-radius*Math.cos(sat.lat)*Math.sin(sat.lon)
 
 sat.mesh.position.set(x,y,z)
-sat.label.position.set(x,y+0.2,z)
+sat.label.position.set(x,y+0.15,z)
 
 sat.mesh.material.color.set(0x00ffcc)
 
-}
-
 })
 
-// COLLISION
+}
+
+// COLLISION CHECK
 
 let risk=false
 
@@ -307,8 +383,7 @@ risk=true
 
 }
 
-if(risk) setWarning("⚠ Collision Risk Detected")
-else setWarning("No Collision Risk")
+setWarning(risk?"⚠ Collision Risk Detected":"No Collision Risk")
 
 controls.update()
 renderer.render(scene,camera)
@@ -323,17 +398,21 @@ setInterval(()=>{
 
 if(satellitesRef.current.length<2) return
 
-const a = satellitesRef.current[Math.floor(Math.random()*satellitesRef.current.length)]
-const b = satellitesRef.current[Math.floor(Math.random()*satellitesRef.current.length)]
+const a=satellitesRef.current[Math.floor(Math.random()*satellitesRef.current.length)]
+const b=satellitesRef.current[Math.floor(Math.random()*satellitesRef.current.length)]
 
 if(a!==b){
 
 const d=a.mesh.position.distanceTo(b.mesh.position)
 
-if(d<1){
+if(d<0.2){
+
 setPrediction(`Possible conjunction: ${a.name} ↔ ${b.name}`)
+
 }else{
+
 setPrediction("No high-risk conjunction detected")
+
 }
 
 }
@@ -342,7 +421,7 @@ setPrediction("No high-risk conjunction detected")
 
 },[])
 
-// SPEED
+// SPEED CONTROL
 
 function changeSpeed(v:number){
 
@@ -355,9 +434,7 @@ setSpeedUI(v)
 
 function togglePause(){
 
-pausedRef.current = !pausedRef.current
-
-setPaused(pausedRef.current)
+setPaused(!paused)
 
 }
 
@@ -388,7 +465,7 @@ width:"260px"
 <input
 type="range"
 min="1"
-max="500"
+max="200"
 value={speedUI}
 onChange={(e)=>changeSpeed(parseInt(e.target.value))}
 style={{width:"200px"}}
@@ -399,15 +476,13 @@ style={{width:"200px"}}
 <button
 onClick={togglePause}
 style={{
-padding:"8px",
-background:"#00ffee",
+padding:"6px 12px",
+background:"#00eaff",
 border:"none",
 cursor:"pointer"
 }}
 >
-
-{paused ? "Resume Simulation" : "Pause Simulation"}
-
+{paused?"Resume Simulation":"Pause Simulation"}
 </button>
 
 <br/><br/>
