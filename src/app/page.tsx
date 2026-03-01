@@ -13,21 +13,17 @@ const mountRef = useRef<HTMLDivElement | null>(null)
 const simulationSpeed = useRef(50)
 
 const satellitesRef = useRef<any[]>([])
+const debrisRef = useRef<any[]>([])
 
-const startRealTime = useRef(Date.now())
+const simTime = useRef(new Date())
+const lastFrame = useRef(Date.now())
 
 const [satCount,setSatCount] = useState(0)
 const [warning,setWarning] = useState("No Collision Risk")
-
+const [prediction,setPrediction] = useState("Scanning future orbits...")
 const [selectedSat,setSelectedSat] = useState<any>(null)
-
 const [speedUI,setSpeedUI] = useState(50)
-
-const [prediction,setPrediction] = useState("Scanning orbits...")
-
 const [paused,setPaused] = useState(false)
-
-const orbitLinesRef = useRef<any[]>([])
 
 useEffect(()=>{
 
@@ -53,6 +49,7 @@ mountRef.current.appendChild(renderer.domElement)
 
 const controls = new OrbitControls(camera,renderer.domElement)
 controls.enableDamping=true
+controls.enablePan=true
 
 const raycaster = new THREE.Raycaster()
 const mouse = new THREE.Vector2()
@@ -95,6 +92,30 @@ new THREE.PointsMaterial({color:0xffffff,size:0.7})
 
 scene.add(stars)
 
+// ORBIT RINGS
+
+function createRing(radius:number,color:number){
+
+const geometry=new THREE.RingGeometry(radius,radius+0.01,128)
+
+const material=new THREE.MeshBasicMaterial({
+color,
+side:THREE.DoubleSide,
+transparent:true,
+opacity:0.4
+})
+
+const mesh=new THREE.Mesh(geometry,material)
+mesh.rotation.x=Math.PI/2
+
+scene.add(mesh)
+
+}
+
+createRing(2.4,0x00ffff)
+createRing(3.2,0xffff00)
+createRing(4.5,0xff0000)
+
 // LABEL
 
 function createLabel(text:string){
@@ -121,31 +142,6 @@ return sprite
 
 }
 
-// ORBIT RINGS
-
-function createRing(radius:number,color:number){
-
-const geometry=new THREE.RingGeometry(radius,radius+0.01,128)
-const material=new THREE.MeshBasicMaterial({
-color,
-side:THREE.DoubleSide,
-transparent:true,
-opacity:0.4
-})
-
-const mesh=new THREE.Mesh(geometry,material)
-mesh.rotation.x=Math.PI/2
-
-scene.add(mesh)
-
-}
-
-createRing(2.4,0x00ffff)
-createRing(3.2,0xffff00)
-createRing(4.5,0xff0000)
-
-// SAT STORAGE
-
 const satellites:any[]=[]
 satellitesRef.current=satellites
 
@@ -153,9 +149,7 @@ satellitesRef.current=satellites
 
 async function loadSatellites(){
 
-const url="/active.txt"
-
-const response=await axios.get(url)
+const response=await axios.get("/active.txt")
 
 const lines=response.data
 .split("\n")
@@ -207,6 +201,29 @@ setSatCount(satellites.length)
 
 loadSatellites()
 
+// SPACE DEBRIS
+
+const debris:any[]=[]
+debrisRef.current=debris
+
+for(let i=0;i<50;i++){
+
+const mesh=new THREE.Mesh(
+new THREE.SphereGeometry(0.04,8,8),
+new THREE.MeshBasicMaterial({color:0xff8800})
+)
+
+scene.add(mesh)
+
+debris.push({
+mesh,
+angle:Math.random()*Math.PI*2,
+radius:2.5+Math.random()*1.5,
+speed:0.002+Math.random()*0.003
+})
+
+}
+
 // CLICK HANDLER
 
 renderer.domElement.addEventListener("click",(event)=>{
@@ -223,12 +240,19 @@ satellitesRef.current.map(s=>s.mesh)
 if(intersects.length>0){
 
 const mesh=intersects[0].object
-
 const sat=satellitesRef.current.find(s=>s.mesh===mesh)
 
 if(!sat) return
 
-// TOGGLE ORBIT
+controls.target.copy(sat.mesh.position)
+
+camera.position.copy(
+sat.mesh.position.clone().add(new THREE.Vector3(0,1.5,2))
+)
+
+controls.update()
+
+// ORBIT TOGGLE
 
 if(sat.orbitLine){
 
@@ -239,9 +263,9 @@ sat.orbitLine=null
 
 const points=[]
 
-for(let i=0;i<360;i+=5){
+for(let i=0;i<1440;i+=5){
 
-const future=new Date(Date.now()+i*60000)
+const future=new Date(simTime.current.getTime()+i*60000)
 
 const pv=satellite.propagate(sat.satrec,future)
 
@@ -265,9 +289,7 @@ points.push(new THREE.Vector3(x,y,z))
 }
 
 const geometry=new THREE.BufferGeometry().setFromPoints(points)
-
 const material=new THREE.LineBasicMaterial({color:0x00ffff})
-
 const line=new THREE.Line(geometry,material)
 
 scene.add(line)
@@ -276,39 +298,92 @@ sat.orbitLine=line
 
 }
 
-// PANEL DATA
-
-let nearest=null
-let minDist=999
-
-satellitesRef.current.forEach(other=>{
-
-if(other===sat) return
-
-const d=sat.mesh.position.distanceTo(other.mesh.position)
-
-if(d<minDist){
-
-minDist=d
-nearest=other
-
-}
-
-})
-
 setSelectedSat({
 name:sat.name,
 alt:sat.alt,
 lat:sat.lat,
-lon:sat.lon,
-closest:nearest?.name || "None",
-distance:minDist.toFixed(3),
-risk:(1/minDist).toFixed(2)
+lon:sat.lon
 })
 
 }
 
 })
+
+// AI FUTURE COLLISION PREDICTION
+
+setInterval(()=>{
+
+const sats=satellitesRef.current
+
+if(sats.length<2) return
+
+let danger=null
+
+for(let t=1;t<=15;t++){
+
+const futureTime=new Date(simTime.current.getTime()+t*60000)
+
+for(let i=0;i<sats.length;i++){
+
+for(let j=i+1;j<sats.length;j++){
+
+const pv1=satellite.propagate(sats[i].satrec,futureTime)
+const pv2=satellite.propagate(sats[j].satrec,futureTime)
+
+if(!pv1.position||!pv2.position) continue
+
+const gmst=satellite.gstime(futureTime)
+
+const geo1=satellite.eciToGeodetic(pv1.position,gmst)
+const geo2=satellite.eciToGeodetic(pv2.position,gmst)
+
+const r1=2+geo1.height/2000
+const r2=2+geo2.height/2000
+
+const x1=r1*Math.cos(geo1.latitude)*Math.cos(geo1.longitude)
+const y1=r1*Math.sin(geo1.latitude)
+const z1=-r1*Math.cos(geo1.latitude)*Math.sin(geo1.longitude)
+
+const x2=r2*Math.cos(geo2.latitude)*Math.cos(geo2.longitude)
+const y2=r2*Math.sin(geo2.latitude)
+const z2=-r2*Math.cos(geo2.latitude)*Math.sin(geo2.longitude)
+
+const dist=Math.sqrt((x1-x2)**2+(y1-y2)**2+(z1-z2)**2)
+
+if(dist<0.12){
+
+danger={
+a:sats[i].name,
+b:sats[j].name,
+t
+}
+
+break
+
+}
+
+}
+
+if(danger) break
+}
+
+if(danger) break
+
+}
+
+if(danger){
+
+setPrediction(`⚠ Future conjunction predicted
+${danger.a} ↔ ${danger.b}
+T-${danger.t} minutes`)
+
+}else{
+
+setPrediction("No dangerous conjunction predicted")
+
+}
+
+},5000)
 
 // SIMULATION LOOP
 
@@ -318,25 +393,30 @@ const animate=()=>{
 
 requestAnimationFrame(animate)
 
-if(!paused){
+if(paused){
+lastFrame.current = Date.now()
+controls.update()
+renderer.render(scene,camera)
+return
+}
 
-const elapsed =
-(Date.now()-startRealTime.current)/1000
+const now = Date.now()
+const delta = (now-lastFrame.current)/1000
+lastFrame.current=now
 
-const simTime = new Date(
-startRealTime.current + elapsed*1000*simulationSpeed.current
+simTime.current = new Date(
+simTime.current.getTime()+delta*1000*simulationSpeed.current*60
 )
 
-earth.rotation.y += 0.0001 * simulationSpeed.current
+earth.rotation.y += 0.0001
 
 satellites.forEach((sat)=>{
 
-const posVel=satellite.propagate(sat.satrec,simTime)
+const posVel=satellite.propagate(sat.satrec,simTime.current)
 
 if(!posVel.position) return
 
-const gmst=satellite.gstime(simTime)
-
+const gmst=satellite.gstime(simTime.current)
 const geo=satellite.eciToGeodetic(posVel.position,gmst)
 
 sat.lon=geo.longitude
@@ -352,38 +432,16 @@ const z=-radius*Math.cos(sat.lat)*Math.sin(sat.lon)
 sat.mesh.position.set(x,y,z)
 sat.label.position.set(x,y+0.15,z)
 
-sat.mesh.material.color.set(0x00ffcc)
-
 })
 
-}
+// DEBRIS MOTION
 
-// COLLISION CHECK
-
-let risk=false
-
-for(let i=0;i<satellites.length;i++){
-
-for(let j=i+1;j<satellites.length;j++){
-
-const d=satellites[i].mesh.position.distanceTo(
-satellites[j].mesh.position
-)
-
-if(d<collisionDistance){
-
-satellites[i].mesh.material.color.set(0xff0000)
-satellites[j].mesh.material.color.set(0xff0000)
-
-risk=true
-
-}
-
-}
-
-}
-
-setWarning(risk?"⚠ Collision Risk Detected":"No Collision Risk")
+debris.forEach(d=>{
+d.angle+=d.speed
+const x=d.radius*Math.cos(d.angle)
+const z=d.radius*Math.sin(d.angle)
+d.mesh.position.set(x,0,z)
+})
 
 controls.update()
 renderer.render(scene,camera)
@@ -392,36 +450,9 @@ renderer.render(scene,camera)
 
 animate()
 
-// AI PREDICTION
-
-setInterval(()=>{
-
-if(satellitesRef.current.length<2) return
-
-const a=satellitesRef.current[Math.floor(Math.random()*satellitesRef.current.length)]
-const b=satellitesRef.current[Math.floor(Math.random()*satellitesRef.current.length)]
-
-if(a!==b){
-
-const d=a.mesh.position.distanceTo(b.mesh.position)
-
-if(d<0.2){
-
-setPrediction(`Possible conjunction: ${a.name} ↔ ${b.name}`)
-
-}else{
-
-setPrediction("No high-risk conjunction detected")
-
-}
-
-}
-
-},5000)
-
 },[])
 
-// SPEED CONTROL
+// SPEED
 
 function changeSpeed(v:number){
 
@@ -477,17 +508,16 @@ style={{width:"200px"}}
 onClick={togglePause}
 style={{
 padding:"6px 12px",
-background:"#00eaff",
-border:"none",
+background:"#111",
+border:"1px solid #444",
+color:"white",
 cursor:"pointer"
 }}
 >
 {paused?"Resume Simulation":"Pause Simulation"}
 </button>
 
-<br/><br/>
-
-<h4>AI Prediction</h4>
+<h4 style={{marginTop:"10px"}}>AI Prediction</h4>
 <p>{prediction}</p>
 
 </div>
@@ -507,13 +537,9 @@ width:"260px"
 <h3>Satellite Info</h3>
 
 <p>Name: {selectedSat.name}</p>
-<p>Altitude: {selectedSat.alt.toFixed(2)} km</p>
-<p>Latitude: {selectedSat.lat.toFixed(2)}</p>
-<p>Longitude: {selectedSat.lon.toFixed(2)}</p>
-
-<p>Closest Satellite: {selectedSat.closest}</p>
-<p>Distance: {selectedSat.distance}</p>
-<p>Collision Risk Score: {selectedSat.risk}</p>
+<p>Altitude: {selectedSat.alt?.toFixed(2)} km</p>
+<p>Latitude: {selectedSat.lat?.toFixed(2)}</p>
+<p>Longitude: {selectedSat.lon?.toFixed(2)}</p>
 
 </div>
 
