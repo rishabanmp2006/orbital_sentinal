@@ -28,7 +28,7 @@ interface DebrisObject {
     radius: number
     speed: number
     spin: number
-    inclination: number   // orbital inclination for 3D debris paths
+    inclination?: number   // orbital inclination for 3D debris paths
     cascadeFragment?: boolean
     velocity?: THREE.Vector3
     life?: number
