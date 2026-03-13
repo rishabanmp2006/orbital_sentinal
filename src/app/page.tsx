@@ -28,9 +28,33 @@ interface DebrisObject {
     radius: number
     speed: number
     spin: number
+    inclination: number   // orbital inclination for 3D debris paths
     cascadeFragment?: boolean
     velocity?: THREE.Vector3
     life?: number
+}
+
+interface DebrisThreat {
+    debrisIdx: number
+    satName: string
+    distance: number       // scene units
+    distanceKm: number
+    relativeVelocity: number  // km/s estimated
+    impactProbability: number // 0-100%
+    timeToClosest: string
+    alertLine?: THREE.Line
+}
+
+interface ConjunctionEvent {
+    id: string
+    satA: string
+    satB: string
+    type: "sat-sat" | "debris-sat"
+    distance: number
+    risk: "low" | "medium" | "high"
+    timeDetected: string
+    tca: string            // time of closest approach (predicted)
+    probability: number    // impact probability %
 }
 
 interface Conjunction {
@@ -102,6 +126,8 @@ export default function Home() {
     const trailsRef = useRef<Map<string, THREE.Line>>(new Map())
     const trailPositionsRef = useRef<Map<string, THREE.Vector3[]>>(new Map())
     const trailsEnabledRef = useRef(true)
+    const alertLinesRef = useRef<THREE.Line[]>([])
+    const debrisThreatsRef = useRef<DebrisThreat[]>([])
     const TRAIL_LENGTH = 40
 
     const [satCount, setSatCount] = useState(0)
@@ -120,6 +146,14 @@ export default function Home() {
     const [cascadeCount, setCascadeCount] = useState(0)
     const [destroyedCount, setDestroyedCount] = useState(0)
     const [trailsEnabled, setTrailsEnabled] = useState(true)
+    const [debrisThreats, setDebrisThreats] = useState<DebrisThreat[]>([])
+    const [showAlertLines, setShowAlertLines] = useState(true)
+    const showAlertLinesRef = useRef(true)
+    const [conjunctionTimeline, setConjunctionTimeline] = useState<ConjunctionEvent[]>([])
+    const [selectedSatImpactProb, setSelectedSatImpactProb] = useState<number | null>(null)
+    const [maneuverRec, setManeuverRec] = useState<string>("")
+    const [maneuverLoading, setManeuverLoading] = useState(false)
+    const [activeLeftTab, setActiveLeftTab] = useState<"status" | "debris" | "timeline">("status")
 
     // ── Search & Filter State ─────────────────────────────────────────────────
     const [searchQuery, setSearchQuery] = useState("")
@@ -200,7 +234,119 @@ export default function Home() {
         globalRiskRef.current = newRisk
     }, [])
 
-    // ── AI Narration ───────────────────────────────────────────────────────────
+    // ── Debris–Satellite Threat Detection ────────────────────────────────────
+
+    const runDebrisThreatDetection = useCallback(() => {
+        const scene = sceneRef.current
+        if (!scene) return
+
+        // Remove old alert lines
+        alertLinesRef.current.forEach(l => scene.remove(l))
+        alertLinesRef.current = []
+
+        const sats = satellitesRef.current.filter(s => !s.destroyed)
+        const debs = debrisRef.current.filter(d => !d.cascadeFragment)
+        const threats: DebrisThreat[] = []
+
+        debs.forEach((deb, di) => {
+            const debPos = deb.mesh.position
+
+            let closest: { sat: SatObject; dist: number } | null = null
+            sats.forEach(sat => {
+                const dist = debPos.distanceTo(sat.position3D)
+                if (!closest || dist < closest.dist) closest = { sat, dist }
+            })
+
+            if (!closest) return
+            const { sat, dist } = closest
+
+            // Only track threats within 0.8 scene units (~400km)
+            if (dist > 0.8) return
+
+            // Estimate relative velocity from orbital speed difference (km/s)
+            // LEO ~7.8 km/s, debris at different altitude = different speed
+            const debAlt = (debPos.length() - 2) * 2000
+            const satAlt = sat.alt
+            const debV = Math.sqrt(398600 / (6371 + debAlt))  // vis-viva
+            const satV = Math.sqrt(398600 / (6371 + satAlt))
+            const relV = Math.abs(debV - satV) + 2 + Math.random() * 4  // add crossing component
+
+            // Impact probability: simplified Pc formula based on distance + relative velocity
+            // Higher velocity = less time to dodge = higher Pc
+            const pc = Math.min(99.9, (1 / (dist * dist * 800)) * (relV / 10) * 100)
+
+            // Predicted TCA (time of closest approach) — random offset for demo
+            const tcaMinutes = Math.floor(5 + Math.random() * 120)
+            const tca = new Date(Date.now() + tcaMinutes * 60000)
+            const tcaStr = `T-${tcaMinutes}m`
+
+            const threat: DebrisThreat = {
+                debrisIdx: di,
+                satName: sat.name,
+                distance: dist,
+                distanceKm: parseFloat((dist * 500).toFixed(1)),
+                relativeVelocity: parseFloat(relV.toFixed(1)),
+                impactProbability: parseFloat(pc.toFixed(2)),
+                timeToClosest: tcaStr,
+            }
+            threats.push(threat)
+
+            // Draw alert line between debris and satellite
+            if (showAlertLinesRef.current) {
+                const lineColor = dist < 0.15 ? 0xff0000 : dist < 0.35 ? 0xff8800 : 0xffff00
+                const lineMat = new THREE.LineBasicMaterial({ color: lineColor, transparent: true, opacity: dist < 0.15 ? 0.9 : 0.5 })
+                const lineGeo = new THREE.BufferGeometry().setFromPoints([debPos.clone(), sat.position3D.clone()])
+                const alertLine = new THREE.Line(lineGeo, lineMat)
+                scene.add(alertLine)
+                alertLinesRef.current.push(alertLine)
+                threat.alertLine = alertLine
+            }
+        })
+
+        // Sort by impact probability
+        threats.sort((a, b) => b.impactProbability - a.impactProbability)
+        const top10 = threats.slice(0, 10)
+        setDebrisThreats(top10)
+        debrisThreatsRef.current = top10
+
+        // Update conjunction timeline with debris events
+        const timelineEvents: ConjunctionEvent[] = [
+            ...conjunctionsRef.current.map((c, i) => ({
+                id: `sat-${i}`,
+                satA: c.satA, satB: c.satB,
+                type: "sat-sat" as const,
+                distance: c.distance / 1000,
+                risk: c.risk,
+                timeDetected: c.timeDetected,
+                tca: `T-${Math.floor(10 + i * 18)}m`,
+                probability: c.risk === "high" ? 12 + Math.random() * 15 : c.risk === "medium" ? 2 + Math.random() * 5 : Math.random() * 1.5,
+            })),
+            ...top10.slice(0, 5).map((t, i) => ({
+                id: `deb-${i}`,
+                satA: `DEBRIS-${t.debrisIdx.toString().padStart(3, "0")}`,
+                satB: t.satName,
+                type: "debris-sat" as const,
+                distance: t.distanceKm,
+                risk: t.impactProbability > 10 ? "high" as const : t.impactProbability > 1 ? "medium" as const : "low" as const,
+                timeDetected: new Date().toLocaleTimeString(),
+                tca: t.timeToClosest,
+                probability: t.impactProbability,
+            })),
+        ]
+        timelineEvents.sort((a, b) => a.probability - b.probability)
+        setConjunctionTimeline(timelineEvents.slice(0, 12))
+
+    }, [])
+
+    // Update impact probability for selected satellite
+    const updateSelectedSatImpactProb = useCallback(() => {
+        if (!selectedSat) { setSelectedSatImpactProb(null); return }
+        const threats = debrisThreatsRef.current.filter(t => t.satName === selectedSat.name)
+        if (threats.length === 0) { setSelectedSatImpactProb(0); return }
+        // Combined probability (1 - product of non-impact probabilities)
+        const combined = 1 - threats.reduce((acc, t) => acc * (1 - t.impactProbability / 100), 1)
+        setSelectedSatImpactProb(parseFloat((combined * 100).toFixed(3)))
+    }, [selectedSat])
 
     const fetchNarration = useCallback(async (conjs: Conjunction[], risk: string, satCnt: number, customMsg?: string) => {
         setAiLoading(true)
@@ -377,7 +523,41 @@ export default function Home() {
         return () => clearInterval(interval)
     }, [fetchSpaceWeather])
 
-    // ── Kessler Cascade ────────────────────────────────────────────────────────
+    // Run debris threat detection every 1.5 seconds
+    useEffect(() => {
+        const interval = setInterval(() => {
+            runDebrisThreatDetection()
+            updateSelectedSatImpactProb()
+        }, 1500)
+        return () => clearInterval(interval)
+    }, [runDebrisThreatDetection, updateSelectedSatImpactProb])
+
+    // ── Maneuver Recommendation ────────────────────────────────────────────────
+
+    const requestManeuver = useCallback(async () => {
+        if (!selectedSat) return
+        setManeuverLoading(true)
+        setManeuverRec("")
+        const threats = debrisThreatsRef.current.filter(t => t.satName === selectedSat.name)
+        try {
+            const res = await fetch("/api/ai", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    mode: "chat",
+                    question: `Generate a specific collision avoidance maneuver for satellite "${selectedSat.name}" at ${selectedSat.alt?.toFixed(0)}km (${selectedSat.orbitType}). Debris threats nearby: ${JSON.stringify(threats.slice(0, 3))}. Include exact delta-V in m/s, burn direction (prograde/retrograde/radial), timing before TCA, altitude change result, and new Pc. Be quantitatively specific. Max 75 words.`,
+                    conjunctions: conjunctionsRef.current,
+                    globalRisk: globalRiskRef.current,
+                    satCount, selectedSat, chatHistory: [],
+                }),
+            })
+            const data = await res.json()
+            setManeuverRec(data.text || data.error || "No recommendation available")
+        } catch {
+            setManeuverRec("⚠ AI offline — manual planning required")
+        }
+        setManeuverLoading(false)
+    }, [selectedSat, satCount])
 
     const triggerKessler = useCallback(() => {
         const scene = sceneRef.current
@@ -801,10 +981,11 @@ export default function Home() {
         loadSatellites()
 
         // ── Debris ───────────────────────────────────────────────────────────────
+        // Each debris piece has a random inclination so they orbit in 3D, not just equatorial
 
         const debris: DebrisObject[] = []
         debrisRef.current = debris
-        for (let i = 0; i < 60; i++) {
+        for (let i = 0; i < 80; i++) {
             const type = Math.floor(Math.random() * 3)
             const mesh = type === 0
                 ? new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.008, 0.04), new THREE.MeshBasicMaterial({ color: 0xff6600 }))
@@ -812,7 +993,14 @@ export default function Home() {
                     ? new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.015, 0.07, 6), new THREE.MeshBasicMaterial({ color: 0xff4400 }))
                     : new THREE.Mesh(new THREE.TetrahedronGeometry(0.04), new THREE.MeshBasicMaterial({ color: 0xff8800 }))
             scene.add(mesh)
-            debris.push({ mesh, angle: Math.random() * Math.PI * 2, radius: 2.4 + Math.random() * 1.8, speed: 0.001 + Math.random() * 0.003, spin: Math.random() * 0.03 })
+            debris.push({
+                mesh,
+                angle: Math.random() * Math.PI * 2,
+                radius: 2.3 + Math.random() * 2.2,
+                speed: 0.0008 + Math.random() * 0.003,
+                spin: Math.random() * 0.03,
+                inclination: (Math.random() - 0.5) * Math.PI * 0.8,  // up to ±72° inclination
+            })
         }
 
         // ── Click Handler ────────────────────────────────────────────────────────
@@ -968,8 +1156,13 @@ export default function Home() {
 
             // ── Debris ──────────────────────────────────────────────────────────
             debrisRef.current.forEach(d => {
+                if (d.cascadeFragment) return  // cascade frags handled separately
                 d.angle += d.speed
-                d.mesh.position.set(d.radius * Math.cos(d.angle), 0, d.radius * Math.sin(d.angle))
+                // Apply inclination to get 3D orbit
+                const x = d.radius * Math.cos(d.angle)
+                const y = d.radius * Math.sin(d.angle) * Math.sin(d.inclination)
+                const z = d.radius * Math.sin(d.angle) * Math.cos(d.inclination)
+                d.mesh.position.set(x, y, z)
                 d.mesh.rotation.x += d.spin; d.mesh.rotation.y += d.spin
             })
 
@@ -1012,6 +1205,16 @@ export default function Home() {
             trailsRef.current.forEach(trail => scene?.remove(trail))
             trailsRef.current.clear()
             trailPositionsRef.current.clear()
+        }
+    }
+
+    const toggleAlertLines = () => {
+        showAlertLinesRef.current = !showAlertLinesRef.current
+        setShowAlertLines(showAlertLinesRef.current)
+        if (!showAlertLinesRef.current) {
+            const scene = sceneRef.current
+            alertLinesRef.current.forEach(l => scene?.remove(l))
+            alertLinesRef.current = []
         }
     }
 
@@ -1168,74 +1371,143 @@ export default function Home() {
 
             {/* ── Left Panel ─────────────────────────────────────────────────────── */}
             <div className={`panel ${kesslerActive ? "kessler-panel" : ""}`} style={{
-                position: "absolute", top: 24, left: 24, width: 270, padding: "18px 20px",
+                position: "absolute", top: 24, left: 24, width: 278, padding: "16px 18px", maxHeight: "calc(100vh - 48px)", overflowY: "auto",
             }}>
                 <div className="panel-title">⬡ Orbital Sentinel</div>
 
+                {/* Global risk banner */}
                 <div style={{
-                    padding: "10px 14px", borderRadius: "3px", background: rc.bg,
-                    border: `1px solid ${rc.border}`, marginBottom: "16px", textAlign: "center",
+                    padding: "9px 14px", borderRadius: "3px", background: rc.bg,
+                    border: `1px solid ${rc.border}`, marginBottom: "12px", textAlign: "center",
                     ...(rc.pulse && globalRisk === "high" ? { animation: "pulse-high 1.2s ease-in-out infinite" } : {}),
                     ...(rc.pulse && globalRisk === "medium" ? { animation: "pulse-med 2s ease-in-out infinite" } : {}),
                 }}>
-                    <div style={{ fontFamily: "'Orbitron', sans-serif", fontSize: "13px", fontWeight: 900, color: rc.color, letterSpacing: "2px" }}>
-                        {rc.label}
-                    </div>
-                    <div style={{ fontSize: "10px", color: "rgba(150,200,255,0.5)", marginTop: 3 }}>
-                        {conjunctions.length} conjunction{conjunctions.length !== 1 ? "s" : ""} detected
+                    <div style={{ fontFamily: "'Orbitron', sans-serif", fontSize: "13px", fontWeight: 900, color: rc.color, letterSpacing: "2px" }}>{rc.label}</div>
+                    <div style={{ fontSize: "10px", color: "rgba(150,200,255,0.5)", marginTop: 2 }}>
+                        {conjunctions.length} sat conjunctions · {debrisThreats.filter(t => t.impactProbability > 1).length} debris threats
                     </div>
                 </div>
 
-                <div className="stat-row"><span className="stat-label">TRACKED OBJECTS</span><span className="stat-value">{satCount - destroyedCount}</span></div>
-                <div className="stat-row"><span className="stat-label">DEBRIS OBJECTS</span><span className="stat-value">{60 + cascadeCount}</span></div>
-                {destroyedCount > 0 && (
-                    <div className="stat-row"><span className="stat-label">DESTROYED</span><span className="stat-value" style={{ color: "#ff2200" }}>{destroyedCount}</span></div>
-                )}
-                <div className="stat-row" style={{ marginBottom: 16 }}>
-                    <span className="stat-label">SIM TIME</span>
-                    <span className="stat-value" style={{ fontSize: 10 }}>{simTimeDisplay || "—"}</span>
+                {/* Left panel tabs */}
+                <div style={{ display: "flex", marginBottom: 12, borderBottom: "1px solid rgba(0,180,255,0.15)" }}>
+                    {(["status", "debris", "timeline"] as const).map(tab => (
+                        <button key={tab} className={`tab-btn ${activeLeftTab === tab ? "active" : ""}`}
+                            onClick={() => setActiveLeftTab(tab)} style={{ fontSize: 9, letterSpacing: "0.5px" }}>
+                            {tab === "status" ? "STATUS" : tab === "debris" ? `DEBRIS (${debrisThreats.length})` : "TIMELINE"}
+                        </button>
+                    ))}
                 </div>
 
-                {!loaded && (
-                    <div style={{ marginBottom: 14 }}>
-                        <div style={{ fontSize: 10, color: "rgba(0,200,255,0.6)", marginBottom: 4 }}>LOADING TLE DATA... {loadingProgress}%</div>
-                        <div className="loading-bar"><div className="loading-fill" style={{ width: `${loadingProgress}%` }} /></div>
+                {/* STATUS TAB */}
+                {activeLeftTab === "status" && (<>
+                    <div className="stat-row"><span className="stat-label">TRACKED OBJECTS</span><span className="stat-value">{satCount - destroyedCount}</span></div>
+                    <div className="stat-row"><span className="stat-label">DEBRIS TRACKED</span><span className="stat-value">{80 + cascadeCount}</span></div>
+                    <div className="stat-row"><span className="stat-label">ACTIVE THREATS</span>
+                        <span style={{ color: debrisThreats.filter(t => t.impactProbability > 5).length > 0 ? "#ff4400" : "#00ff88", fontWeight: "bold" }}>
+                            {debrisThreats.filter(t => t.impactProbability > 5).length}
+                        </span>
                     </div>
-                )}
-
-                <div style={{ marginTop: 8 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}>
-                        <span className="stat-label">TIME WARP</span>
-                        <span style={{ color: "#00ccff", fontWeight: "bold" }}>{speedUI}×</span>
+                    {destroyedCount > 0 && (
+                        <div className="stat-row"><span className="stat-label">DESTROYED</span><span className="stat-value" style={{ color: "#ff2200" }}>{destroyedCount}</span></div>
+                    )}
+                    <div className="stat-row" style={{ marginBottom: 12 }}>
+                        <span className="stat-label">SIM TIME</span>
+                        <span className="stat-value" style={{ fontSize: 10 }}>{simTimeDisplay || "—"}</span>
                     </div>
-                    <input type="range" min={1} max={200} value={speedUI}
-                        onChange={(e) => changeSpeed(parseInt(e.target.value))} className="speed-slider" />
-                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: "rgba(150,200,255,0.35)" }}>
-                        <span>1×</span><span>REALTIME</span><span>200×</span>
+
+                    {!loaded && (
+                        <div style={{ marginBottom: 12 }}>
+                            <div style={{ fontSize: 10, color: "rgba(0,200,255,0.6)", marginBottom: 4 }}>LOADING TLE DATA... {loadingProgress}%</div>
+                            <div className="loading-bar"><div className="loading-fill" style={{ width: `${loadingProgress}%` }} /></div>
+                        </div>
+                    )}
+
+                    <div style={{ marginTop: 6, marginBottom: 12 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}>
+                            <span className="stat-label">TIME WARP</span>
+                            <span style={{ color: "#00ccff", fontWeight: "bold" }}>{speedUI}×</span>
+                        </div>
+                        <input type="range" min={1} max={200} value={speedUI}
+                            onChange={(e) => changeSpeed(parseInt(e.target.value))} className="speed-slider" />
                     </div>
-                </div>
 
-                <button onClick={togglePause} className={`action-btn ${paused ? "" : "danger"}`}>
-                    {paused ? "▶ RESUME SIMULATION" : "⏸ PAUSE SIMULATION"}
-                </button>
-
-                {/* Kessler Button */}
-                {!kesslerActive ? (
-                    <button onClick={triggerKessler} className="action-btn kessler" title="Requires a HIGH RISK conjunction">
-                        ☢ SIMULATE KESSLER CASCADE
+                    <button onClick={togglePause} className={`action-btn ${paused ? "" : "danger"}`} style={{ marginTop: 0 }}>
+                        {paused ? "▶ RESUME SIMULATION" : "⏸ PAUSE SIMULATION"}
                     </button>
-                ) : (
-                    <button onClick={resetKessler} className="action-btn reset">
-                        ↺ RESET CASCADE
-                    </button>
-                )}
+                    {!kesslerActive ? (
+                        <button onClick={triggerKessler} className="action-btn kessler">☢ KESSLER CASCADE SIM</button>
+                    ) : (
+                        <button onClick={resetKessler} className="action-btn reset">↺ RESET CASCADE</button>
+                    )}
+                    {kesslerActive && (
+                        <div style={{ marginTop: 6, padding: "5px 8px", background: "rgba(255,34,0,0.08)", border: "1px solid rgba(255,34,0,0.2)", borderRadius: 3, fontSize: 10, color: "rgba(255,150,100,0.8)", lineHeight: 1.5 }}>
+                            {kesslerPhase === "cascade" && `Cascade wave... ${destroyedCount} destroyed`}
+                            {kesslerPhase === "done" && `Cascade complete. Reload to restore.`}
+                        </div>
+                    )}
+                </>)}
 
-                {kesslerActive && (
-                    <div style={{ marginTop: 8, padding: "6px 10px", background: "rgba(255,34,0,0.08)", border: "1px solid rgba(255,34,0,0.2)", borderRadius: 3, fontSize: 10, color: "rgba(255,150,100,0.8)", lineHeight: 1.5 }}>
-                        {kesslerPhase === "cascade" && `Wave propagating... ${destroyedCount} satellites destroyed`}
-                        {kesslerPhase === "done" && `Cascade complete. Reload page to restore satellites.`}
+                {/* DEBRIS THREATS TAB */}
+                {activeLeftTab === "debris" && (<>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                        <span style={{ fontSize: 10, color: "rgba(150,200,255,0.5)" }}>DEBRIS–SAT PROXIMITY</span>
+                        <button onClick={toggleAlertLines} style={{ fontSize: 9, background: "none", border: `1px solid ${showAlertLines ? "rgba(255,180,0,0.4)" : "rgba(100,100,100,0.3)"}`, borderRadius: 2, color: showAlertLines ? "#ffcc00" : "rgba(150,150,150,0.5)", padding: "2px 7px", cursor: "pointer", fontFamily: "'Share Tech Mono', monospace" }}>
+                            {showAlertLines ? "⚡ LINES ON" : "○ LINES OFF"}
+                        </button>
                     </div>
-                )}
+
+                    {debrisThreats.length === 0 ? (
+                        <div style={{ textAlign: "center", padding: "20px 0", color: "rgba(150,200,255,0.3)", fontSize: 11 }}>No debris threats in range</div>
+                    ) : debrisThreats.map((t, i) => {
+                        const pcColor = t.impactProbability > 10 ? "#ff2200" : t.impactProbability > 1 ? "#ffaa00" : "#ffff44"
+                        return (
+                            <div key={i} style={{ padding: "8px 10px", marginBottom: 6, background: "rgba(255,80,0,0.06)", border: `1px solid ${pcColor}44`, borderLeft: `3px solid ${pcColor}`, borderRadius: 3, fontSize: 11 }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+                                    <span style={{ color: "#ff8844", fontSize: 9, fontFamily: "'Orbitron', sans-serif", letterSpacing: "1px" }}>
+                                        DEB-{t.debrisIdx.toString().padStart(3, "0")}
+                                    </span>
+                                    <span style={{ color: pcColor, fontWeight: "bold", fontSize: 10 }}>Pc {t.impactProbability.toFixed(2)}%</span>
+                                </div>
+                                <div style={{ color: "#c8e8ff", marginBottom: 2 }}>↔ {t.satName.slice(0, 20)}</div>
+                                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "rgba(150,200,255,0.5)" }}>
+                                    <span>{t.distanceKm} km</span>
+                                    <span>{t.relativeVelocity} km/s rel-v</span>
+                                    <span>{t.timeToClosest}</span>
+                                </div>
+                            </div>
+                        )
+                    })}
+                </>)}
+
+                {/* CONJUNCTION TIMELINE TAB */}
+                {activeLeftTab === "timeline" && (<>
+                    <div style={{ fontSize: 10, color: "rgba(150,200,255,0.4)", marginBottom: 8 }}>NEXT 24H PREDICTED EVENTS</div>
+                    {conjunctionTimeline.length === 0 ? (
+                        <div style={{ textAlign: "center", padding: "20px 0", color: "rgba(150,200,255,0.3)", fontSize: 11 }}>No predicted events</div>
+                    ) : conjunctionTimeline.map((ev, i) => {
+                        const evColor = ev.risk === "high" ? "#ff2200" : ev.risk === "medium" ? "#ffaa00" : "#ffff44"
+                        const typeIcon = ev.type === "debris-sat" ? "🔶" : "🔵"
+                        return (
+                            <div key={i} style={{ padding: "7px 10px", marginBottom: 5, background: `${evColor}0d`, borderLeft: `3px solid ${evColor}`, borderRadius: 3, fontSize: 10, lineHeight: 1.6 }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
+                                    <span style={{ color: evColor, fontFamily: "'Orbitron', sans-serif", fontSize: 8, letterSpacing: "1px" }}>
+                                        {typeIcon} {ev.type === "debris-sat" ? "DEBRIS THREAT" : "SAT CONJUNCTION"}
+                                    </span>
+                                    <span style={{ color: "#00ccff", fontSize: 9 }}>{ev.tca}</span>
+                                </div>
+                                <div style={{ color: "#c8e8ff" }}>{ev.satA.slice(0, 16)} ↔ {ev.satB.slice(0, 16)}</div>
+                                <div style={{ display: "flex", justifyContent: "space-between", marginTop: 2, color: "rgba(150,200,255,0.5)" }}>
+                                    <span>Pc: <span style={{ color: evColor }}>{ev.probability.toFixed(2)}%</span></span>
+                                    <span>{ev.distance.toFixed(1)} km</span>
+                                </div>
+                                {/* Probability bar */}
+                                <div style={{ marginTop: 4, height: 2, background: "rgba(255,255,255,0.08)", borderRadius: 1 }}>
+                                    <div style={{ height: "100%", width: `${Math.min(100, ev.probability * 5)}%`, background: evColor, borderRadius: 1 }} />
+                                </div>
+                            </div>
+                        )
+                    })}
+                </>)}
             </div>
 
             {/* ── Right Panel ────────────────────────────────────────────────────── */}
@@ -1273,7 +1545,43 @@ export default function Home() {
                                         }
                                     </span>
                                 </div>
-                                <div style={{ marginTop: 12, padding: "8px 10px", background: "rgba(0,180,255,0.05)", borderRadius: 3, fontSize: 11, color: "rgba(150,200,255,0.6)" }}>
+
+                                {/* ── Impact Probability Meter ─────────────────────────── */}
+                                <div style={{ marginTop: 14, padding: "10px 12px", background: "rgba(255,60,0,0.06)", border: "1px solid rgba(255,100,0,0.2)", borderRadius: 3 }}>
+                                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                                        <span style={{ fontFamily: "'Orbitron', sans-serif", fontSize: 8, color: "rgba(255,150,100,0.7)", letterSpacing: "1.5px" }}>DEBRIS IMPACT PROBABILITY</span>
+                                        <span style={{ fontSize: 13, fontWeight: "bold", color: selectedSatImpactProb != null && selectedSatImpactProb > 5 ? "#ff2200" : selectedSatImpactProb != null && selectedSatImpactProb > 0.5 ? "#ffaa00" : "#00ff88" }}>
+                                            {selectedSatImpactProb != null ? `${selectedSatImpactProb.toFixed(3)}%` : "—"}
+                                        </span>
+                                    </div>
+                                    {/* Gauge bar */}
+                                    <div style={{ height: 6, background: "rgba(255,255,255,0.06)", borderRadius: 3, overflow: "hidden" }}>
+                                        <div style={{
+                                            height: "100%",
+                                            width: `${Math.min(100, (selectedSatImpactProb ?? 0) * 10)}%`,
+                                            background: selectedSatImpactProb != null && selectedSatImpactProb > 5 ? "linear-gradient(90deg,#ff4400,#ff0000)" : selectedSatImpactProb != null && selectedSatImpactProb > 0.5 ? "linear-gradient(90deg,#ff8800,#ffcc00)" : "#00ff88",
+                                            borderRadius: 3, transition: "width 0.5s ease",
+                                        }} />
+                                    </div>
+                                    <div style={{ fontSize: 9, color: "rgba(150,200,255,0.35)", marginTop: 4 }}>
+                                        {debrisThreats.filter(t => t.satName === selectedSat.name).length} debris objects within tracking range
+                                    </div>
+                                </div>
+
+                                {/* ── Maneuver Recommendation ──────────────────────────── */}
+                                <button onClick={requestManeuver} disabled={maneuverLoading}
+                                    style={{ marginTop: 10, width: "100%", padding: "8px", background: "rgba(0,255,180,0.07)", border: "1px solid rgba(0,255,180,0.25)", borderRadius: 3, color: "#00ffcc", fontFamily: "'Share Tech Mono', monospace", fontSize: 10, letterSpacing: "1.5px", cursor: maneuverLoading ? "wait" : "pointer", textTransform: "uppercase" }}>
+                                    {maneuverLoading ? "⟳ COMPUTING MANEUVER..." : "🛸 AI MANEUVER RECOMMENDATION"}
+                                </button>
+
+                                {maneuverRec && (
+                                    <div style={{ marginTop: 8, padding: "10px 12px", background: "rgba(0,255,180,0.05)", border: "1px solid rgba(0,255,180,0.15)", borderRadius: 3, fontSize: 11, lineHeight: 1.65, color: "#c8e8ff" }}>
+                                        <div style={{ fontFamily: "'Orbitron', sans-serif", fontSize: 8, color: "rgba(0,255,180,0.5)", letterSpacing: "1.5px", marginBottom: 6 }}>SENTINEL-AI MANEUVER PLAN</div>
+                                        {maneuverRec}
+                                    </div>
+                                )}
+
+                                <div style={{ marginTop: 10, padding: "7px 10px", background: "rgba(0,180,255,0.05)", borderRadius: 3, fontSize: 10, color: "rgba(150,200,255,0.5)" }}>
                                     💡 Click satellite again to toggle orbit path
                                 </div>
                             </>
