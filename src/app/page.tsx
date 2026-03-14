@@ -128,6 +128,8 @@ export default function Home() {
     const trailsEnabledRef = useRef(true)
     const alertLinesRef = useRef<THREE.Line[]>([])
     const debrisThreatsRef = useRef<DebrisThreat[]>([])
+    const issRef = useRef<THREE.Group | null>(null)
+    const shadowConeRef = useRef<THREE.Mesh | null>(null)
     const TRAIL_LENGTH = 40
 
     const [satCount, setSatCount] = useState(0)
@@ -146,6 +148,10 @@ export default function Home() {
     const [cascadeCount, setCascadeCount] = useState(0)
     const [destroyedCount, setDestroyedCount] = useState(0)
     const [trailsEnabled, setTrailsEnabled] = useState(true)
+    const [issData, setIssData] = useState<{ alt: number; lat: number; lon: number; inEclipse: boolean; speed: number } | null>(null)
+    const [eclipsedSats, setEclipsedSats] = useState<string[]>([])
+    const [showEclipseShadow, setShowEclipseShadow] = useState(true)
+    const showEclipseShadowRef = useRef(true)
     const [debrisThreats, setDebrisThreats] = useState<DebrisThreat[]>([])
     const [showAlertLines, setShowAlertLines] = useState(true)
     const showAlertLinesRef = useRef(true)
@@ -792,6 +798,84 @@ export default function Home() {
         createRing(3.2, 0xffff00, 0.20)
         createRing(4.5, 0xff4400, 0.15)
 
+        // ── ISS Special Model ─────────────────────────────────────────────────────
+        // Distinctive model: larger, white body, big solar arrays, red glow
+
+        const issGroup = new THREE.Group()
+        scene.add(issGroup)
+        issRef.current = issGroup
+
+        // Main truss body
+        const issBody = new THREE.Mesh(
+            new THREE.BoxGeometry(0.22, 0.045, 0.055),
+            new THREE.MeshBasicMaterial({ color: 0xffffff })
+        )
+        issGroup.add(issBody)
+
+        // Solar arrays (4 pairs)
+        const solarMat = new THREE.MeshBasicMaterial({ color: 0x1a3a8a })
+        const arrayOffsets = [-0.09, -0.03, 0.03, 0.09]
+        arrayOffsets.forEach(ox => {
+            const arr1 = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.001, 0.14), solarMat)
+            arr1.position.set(ox, 0, 0.14)
+            const arr2 = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.001, 0.14), solarMat)
+            arr2.position.set(ox, 0, -0.14)
+            issGroup.add(arr1, arr2)
+        })
+
+        // Habitation modules
+        const modMat = new THREE.MeshBasicMaterial({ color: 0xdddddd })
+            ;[-0.055, 0, 0.055].forEach(oz => {
+                const mod = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.022, 0.09, 8), modMat)
+                mod.rotation.z = Math.PI / 2
+                mod.position.set(0, 0, oz)
+                issGroup.add(mod)
+            })
+
+        // ISS glow — pulsing white halo
+        const issGlow = new THREE.Mesh(
+            new THREE.SphereGeometry(0.18, 16, 16),
+            new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.12, side: THREE.BackSide })
+        )
+        issGroup.add(issGlow)
+
+        // ISS label — special gold color
+        const issLabelCanvas = document.createElement("canvas")
+        issLabelCanvas.width = 320; issLabelCanvas.height = 80
+        const issCtx = issLabelCanvas.getContext("2d")!
+        issCtx.font = "bold 20px monospace"
+        issCtx.fillStyle = "#ffcc00"
+        issCtx.fillText("🛸 ISS", 8, 44)
+        const issLabelSprite = new THREE.Sprite(
+            new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(issLabelCanvas), transparent: true })
+        )
+        issLabelSprite.scale.set(0.9, 0.3, 1)
+        issLabelSprite.position.set(0, 0.28, 0)
+        issGroup.add(issLabelSprite)
+
+        // ── Eclipse Shadow Cone ───────────────────────────────────────────────────
+        // A dark cone extending from Earth away from the sun direction
+        // Sun is at positive X in scene (sunLight.position = 10,5,5)
+
+        const shadowConeMat = new THREE.MeshBasicMaterial({
+            color: 0x000011,
+            transparent: true,
+            opacity: 0.55,
+            side: THREE.BackSide,
+        })
+        // ConeGeometry(radius, height, segments)
+        // Cone tip at Earth center, opens away from sun
+        const shadowCone = new THREE.Mesh(
+            new THREE.ConeGeometry(2.05, 12, 64, 1, true),
+            shadowConeMat
+        )
+        // Rotate so cone opens in -X direction (away from sun at +X)
+        shadowCone.rotation.z = -Math.PI / 2
+        // Move so tip is at Earth center
+        shadowCone.position.set(-6, 0, 0)
+        scene.add(shadowCone)
+        shadowConeRef.current = shadowCone
+
         // ── Sun ──────────────────────────────────────────────────────────────────
 
         const solarGroup = new THREE.Group()
@@ -1109,6 +1193,8 @@ export default function Home() {
             })
 
             // ── Satellites ───────────────────────────────────────────────────────
+            const eclipsedNames: string[] = []
+
             satellitesRef.current.forEach(sat => {
                 if (sat.destroyed) return
                 const pv = satellite.propagate(sat.satrec, simTime.current)
@@ -1123,6 +1209,32 @@ export default function Home() {
                 sat.mesh.position.set(x, y, z)
                 sat.label.position.set(x, y + 0.18, z)
                 sat.position3D.set(x, y, z)
+
+                // ── ISS detection ─────────────────────────────────────────────────
+                const isISS = sat.name.toUpperCase().includes("ISS") || sat.name.toUpperCase().includes("ZARYA")
+                if (isISS && issRef.current) {
+                    issRef.current.position.set(x, y, z)
+                    issRef.current.lookAt(0, 0, 0)  // always face Earth
+                    // Eclipse check for ISS specifically
+                    const inEclipse = x < 0 && Math.sqrt(y * y + z * z) < 2.05
+                    const speed = parseFloat((Math.sqrt(398600 / (6371 + sat.alt))).toFixed(2))
+                    setIssData({ alt: sat.alt, lat: sat.lat * 180 / Math.PI, lon: sat.lon * 180 / Math.PI, inEclipse, speed })
+                    // Hide default mesh — ISS has its own special model
+                    sat.mesh.visible = false
+                    sat.label.visible = false
+                }
+
+                // ── Eclipse check for all sats ────────────────────────────────────
+                // Simple cylindrical shadow: behind Earth (x < 0) and within Earth radius in y-z plane
+                const inEclipse = x < -1.8 && Math.sqrt(y * y + z * z) < 2.0
+                if (inEclipse) {
+                    eclipsedNames.push(sat.name)
+                    // Dim the satellite visually
+                    if (!isISS) {
+                        const mat = (sat.mesh.children[0] as THREE.Mesh).material as THREE.MeshBasicMaterial
+                        mat.color.setHex(0x222244)
+                    }
+                }
 
                 // ── Motion trail ───────────────────────────────────────────────────
                 if (trailsEnabledRef.current) {
@@ -1148,11 +1260,18 @@ export default function Home() {
                         trailsRef.current.set(key, trail)
                     }
                 } else {
-                    // Clean up trails if disabled
                     const existing = trailsRef.current.get(sat.name)
                     if (existing) { scene.remove(existing); trailsRef.current.delete(sat.name) }
                 }
             })
+
+            // Update eclipse state every frame for status display
+            setEclipsedSats(eclipsedNames)
+
+            // Show/hide shadow cone
+            if (shadowConeRef.current) {
+                shadowConeRef.current.visible = showEclipseShadowRef.current
+            }
 
             // ── Debris ──────────────────────────────────────────────────────────
             debrisRef.current.forEach(d => {
@@ -1160,8 +1279,8 @@ export default function Home() {
                 d.angle += d.speed
                 // Apply inclination to get 3D orbit
                 const x = d.radius * Math.cos(d.angle)
-                const y = d.radius * Math.sin(d.angle) * Math.sin(d.inclination)
-                const z = d.radius * Math.sin(d.angle) * Math.cos(d.inclination)
+                const y = d.radius * Math.sin(d.angle) * Math.sin(d.inclination ?? 0)
+                const z = d.radius * Math.sin(d.angle) * Math.cos(d.inclination ?? 0)
                 d.mesh.position.set(x, y, z)
                 d.mesh.rotation.x += d.spin; d.mesh.rotation.y += d.spin
             })
@@ -1216,6 +1335,11 @@ export default function Home() {
             alertLinesRef.current.forEach(l => scene?.remove(l))
             alertLinesRef.current = []
         }
+    }
+
+    const toggleEclipseShadow = () => {
+        showEclipseShadowRef.current = !showEclipseShadowRef.current
+        setShowEclipseShadow(showEclipseShadowRef.current)
     }
 
     const riskConfig = {
@@ -1778,6 +1902,57 @@ export default function Home() {
                         </div>
                     </>
                 ) : null}
+            </div>
+
+            {/* ── ISS Live Panel ───────────────────────────────────────────────────── */}
+            {issData && (
+                <div className="panel" style={{
+                    position: "fixed", top: 24, left: "50%", transform: "translateX(-50%)",
+                    padding: "10px 18px", zIndex: 10, display: "flex", gap: 20, alignItems: "center",
+                    border: issData.inEclipse ? "1px solid rgba(80,80,255,0.5)" : "1px solid rgba(255,200,0,0.4)",
+                    background: issData.inEclipse ? "rgba(10,10,40,0.92)" : "rgba(20,15,0,0.92)",
+                }}>
+                    {/* ISS icon pulsing */}
+                    <div style={{ fontFamily: "'Orbitron', sans-serif", fontSize: 11, fontWeight: 700, color: "#ffcc00", letterSpacing: "2px", display: "flex", alignItems: "center", gap: 8 }}>
+                        <span style={{ fontSize: 18, animation: "pulse-med 2s infinite" }}>🛸</span>
+                        <span>ISS</span>
+                    </div>
+                    <div style={{ width: 1, height: 28, background: "rgba(255,200,0,0.2)" }} />
+                    <div style={{ fontSize: 10, fontFamily: "'Share Tech Mono', monospace", display: "flex", gap: 16, color: "rgba(200,230,255,0.7)" }}>
+                        <span><span style={{ color: "rgba(150,200,255,0.4)" }}>ALT </span>{issData.alt.toFixed(1)} km</span>
+                        <span><span style={{ color: "rgba(150,200,255,0.4)" }}>LAT </span>{issData.lat.toFixed(2)}°</span>
+                        <span><span style={{ color: "rgba(150,200,255,0.4)" }}>LON </span>{issData.lon.toFixed(2)}°</span>
+                        <span><span style={{ color: "rgba(150,200,255,0.4)" }}>V </span>{issData.speed} km/s</span>
+                    </div>
+                    <div style={{ width: 1, height: 28, background: "rgba(255,200,0,0.2)" }} />
+                    {/* Eclipse status */}
+                    <div style={{
+                        padding: "4px 10px", borderRadius: 3,
+                        background: issData.inEclipse ? "rgba(30,30,120,0.5)" : "rgba(255,200,0,0.12)",
+                        border: `1px solid ${issData.inEclipse ? "rgba(80,80,255,0.4)" : "rgba(255,200,0,0.3)"}`,
+                        fontFamily: "'Orbitron', sans-serif", fontSize: 9, fontWeight: 700,
+                        color: issData.inEclipse ? "#8888ff" : "#ffcc00", letterSpacing: "1.5px",
+                        animation: issData.inEclipse ? "pulse-med 2s infinite" : "none",
+                    }}>
+                        {issData.inEclipse ? "🌑 ECLIPSE" : "☀ SUNLIT"}
+                    </div>
+                </div>
+            )}
+
+            {/* ── Eclipse Shadow Toggle ─────────────────────────────────────────────── */}
+            <div style={{ position: "fixed", bottom: 135, right: 24, zIndex: 10, display: "flex", flexDirection: "column", gap: 6 }}>
+                <button onClick={toggleEclipseShadow} style={{
+                    background: showEclipseShadow ? "rgba(50,50,150,0.2)" : "rgba(0,5,20,0.85)",
+                    border: `1px solid ${showEclipseShadow ? "rgba(100,100,255,0.5)" : "rgba(0,180,255,0.15)"}`,
+                    borderRadius: 4, padding: "8px 14px", color: showEclipseShadow ? "#aaaaff" : "rgba(150,200,255,0.4)",
+                    fontFamily: "'Share Tech Mono', monospace", fontSize: 10, letterSpacing: "1.5px",
+                    cursor: "pointer", backdropFilter: "blur(8px)", transition: "all 0.2s",
+                }}>
+                    {showEclipseShadow ? "🌑 SHADOW ON" : "○ SHADOW OFF"}
+                </button>
+                <div style={{ fontSize: 9, color: "rgba(150,200,255,0.3)", textAlign: "center", fontFamily: "'Share Tech Mono', monospace" }}>
+                    {eclipsedSats.length} sats in eclipse
+                </div>
             </div>
 
             {/* ── Trail Toggle ─────────────────────────────────────────────────────── */}
